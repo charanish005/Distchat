@@ -1,0 +1,89 @@
+# =============================================================================
+# distchat — Docker Compose
+# Starts: primary server, backup server, and two demo clients.
+#
+# Usage:
+#   docker compose up --build          # start everything
+#   docker compose down                # stop everything
+#   docker compose run --rm client \
+#     go run ./client --user=carol \
+#     --addr=primary:50051 \
+#     --backup=backup:50052            # interactive client session
+# =============================================================================
+
+version: "3.9"
+
+services:
+
+  # ── Primary server ──────────────────────────────────────────────────────────
+  primary:
+    build: .
+    container_name: distchat-primary
+    command: >
+      go run ./server
+        --role=primary
+        --port=50051
+        --peer=backup:50052
+    ports:
+      - "50051:50051"
+    networks:
+      - distchat-net
+    restart: on-failure
+
+  # ── Backup server ───────────────────────────────────────────────────────────
+  backup:
+    build: .
+    container_name: distchat-backup
+    command: >
+      go run ./server
+        --role=backup
+        --port=50052
+        --peer=primary:50051
+    ports:
+      - "50052:50052"
+    networks:
+      - distchat-net
+    depends_on:
+      - primary
+    restart: on-failure
+
+  # ── Demo client: alice ──────────────────────────────────────────────────────
+  alice:
+    build: .
+    container_name: distchat-alice
+    command: >
+      go run ./client
+        --user=alice
+        --room=general
+        --addr=primary:50051
+        --backup=backup:50052
+    networks:
+      - distchat-net
+    depends_on:
+      - primary
+      - backup
+    stdin_open: true
+    tty: true
+
+  # ── Demo client: bob ────────────────────────────────────────────────────────
+  bob:
+    build: .
+    container_name: distchat-bob
+    command: >
+      go run ./client
+        --user=bob
+        --room=general
+        --addr=primary:50051
+        --backup=backup:50052
+    networks:
+      - distchat-net
+    depends_on:
+      - primary
+      - backup
+    stdin_open: true
+    tty: true
+
+# ── Network ──────────────────────────────────────────────────────────────────
+networks:
+  distchat-net:
+    driver: bridge
