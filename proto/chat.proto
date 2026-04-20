@@ -1,0 +1,95 @@
+syntax = "proto3";
+
+package chat;
+
+option go_package = "distchat/proto/chat";
+
+// ─────────────────────────────────────────
+//  Chat Service
+// ─────────────────────────────────────────
+
+service ChatService {
+  rpc JoinRoom(stream ChatMessage) returns (stream ChatMessage);
+  rpc ListUsers(Empty) returns (UserList);
+}
+
+message ChatMessage {
+  string sender    = 1;
+  string room      = 2;
+  string content   = 3;
+  int64  timestamp = 4;
+}
+
+message UserList {
+  repeated string usernames = 1;
+}
+
+// ─────────────────────────────────────────
+//  File Service
+// ─────────────────────────────────────────
+
+service FileService {
+  rpc UploadFile(stream FileChunk)     returns (UploadResponse);
+  rpc DownloadFile(DownloadRequest)    returns (stream FileChunk);
+  rpc ListFiles(Empty)                 returns (FileList);
+
+  // Internal: primary calls this on backup to replicate a file after upload
+  rpc ReplicateFile(stream FileChunk)  returns (UploadResponse);
+}
+
+message FileChunk {
+  string filename    = 1;
+  bytes  content     = 2;
+  int64  chunk_index = 3;
+  bool   is_last     = 4;
+  string checksum    = 5;
+}
+
+message UploadResponse {
+  bool   success     = 1;
+  string message     = 2;
+  int64  bytes_saved = 3;
+}
+
+message DownloadRequest {
+  string filename = 1;
+}
+
+message FileList {
+  repeated FileInfo files = 1;
+}
+
+message FileInfo {
+  string filename    = 1;
+  int64  size_bytes  = 2;
+  string uploaded_by = 3;
+  int64  uploaded_at = 4;
+}
+
+// ─────────────────────────────────────────
+//  Health / Heartbeat Service
+// ─────────────────────────────────────────
+
+service HealthService {
+  rpc Ping(PingRequest)      returns (PingResponse);
+  rpc GetStatus(Empty)       returns (ServerStatus);
+}
+
+message PingRequest {
+  string from      = 1;
+  int64  timestamp = 2;
+}
+
+message PingResponse {
+  bool  alive     = 1;
+  int64 timestamp = 2;
+}
+
+message ServerStatus {
+  string role            = 1;
+  int32  connected_users = 2;
+  int32  stored_files    = 3;
+  string uptime          = 4;
+}
+
+message Empty {}

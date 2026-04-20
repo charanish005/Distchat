@@ -1,0 +1,370 @@
+package server
+
+import (
+	"context"
+	"crypto/md5"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"log"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	pb "distchat/proto/chat"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+)
+
+const chunkSize = 32 * 1024
+
+func getStorageDir() string {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "./uploads"
+	}
+	return filepath.Join(cwd, "uploads")
+}
+
+type fileMeta struct {
+	Filename   string
+	SizeBytes  int64
+	UploadedBy string
+	UploadedAt int64
+}
+
+type FileServer struct {
+	pb.UnimplementedFileServiceServer
+	mu         sync.RWMutex
+	files      map[string]*fileMeta
+	backupAddr string
+}
+
+func NewFileServer() *FileServer {
+	dir := getStorageDir()
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		log.Fatalf("cannot create storage dir: %v", err)
+	}
+	log.Printf("[FILE] storage dir: %s", dir)
+	return &FileServer{files: make(map[string]*fileMeta)}
+}
+
+func (s *FileServer) SetBackup(addr string) {
+	s.backupAddr = addr
+	log.Printf("[FILE] replication target set → %s", addr)
+}
+
+// UploadFile — original working logic, replication added at the end.
+func (s *FileServer) UploadFile(stream pb.FileService_UploadFileServer) error {
+	var (
+		filename   string
+		totalBytes int64
+		hasher     = md5.New()
+		tmpPath    string
+		tmpFile    *os.File
+	)
+
+	var lastChecksum string
+	for {
+		chunk, err := stream.Recv()
+		if err == io.EOF {
+			// All chunks received — finalize the file
+			if tmpFile != nil {
+				tmpFile.Close()
+			}
+			if filename != "" {
+				computed := hex.EncodeToString(hasher.Sum(nil))
+				if lastChecksum != "" && computed != lastChecksum {
+					os.Remove(tmpPath)
+					return fmt.Errorf("checksum mismatch")
+				}
+				finalPath := filepath.Join(getStorageDir(), filename)
+				log.Printf("[FILE] renaming %s -> %s", tmpPath, finalPath)
+				if renameErr := os.Rename(tmpPath, finalPath); renameErr != nil {
+					return fmt.Errorf("cannot finalise file: %w", renameErr)
+				}
+				log.Printf("[FILE] ✅ upload complete: %s (%d bytes)", filename, totalBytes)
+				s.mu.Lock()
+				s.files[filename] = &fileMeta{
+					Filename:   filename,
+					SizeBytes:  totalBytes,
+					UploadedBy: "client",
+					UploadedAt: time.Now().UnixMilli(),
+				}
+				s.mu.Unlock()
+				if s.backupAddr != "" {
+					go s.replicateToBackup(filename)
+				}
+			}
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("receive error: %w", err)
+		}
+
+		if filename == "" {
+			if chunk.Filename == "" {
+				return fmt.Errorf("first chunk must include filename")
+			}
+			filename = filepath.Base(chunk.Filename)
+			tmpPath = filepath.Join(getStorageDir(), filename+".tmp")
+			tmpFile, err = os.Create(tmpPath)
+			if err != nil {
+				return fmt.Errorf("cannot create file: %w", err)
+			}
+			log.Printf("[FILE] receiving upload: %s", filename)
+		}
+
+		n, writeErr := tmpFile.Write(chunk.Content)
+		if writeErr != nil {
+			tmpFile.Close()
+			os.Remove(tmpPath)
+			return fmt.Errorf("write error: %w", writeErr)
+		}
+		totalBytes += int64(n)
+		hasher.Write(chunk.Content)
+		if chunk.Checksum != "" {
+			lastChecksum = chunk.Checksum
+		}
+	}
+
+	return stream.SendAndClose(&pb.UploadResponse{
+		Success:    true,
+		Message:    fmt.Sprintf("uploaded %s successfully", filename),
+		BytesSaved: totalBytes,
+	})
+}
+
+// ReplicateFile — called by primary to push file to this backup.
+func (s *FileServer) ReplicateFile(stream pb.FileService_ReplicateFileServer) error {
+	var (
+		filename   string
+		totalBytes int64
+		hasher     = md5.New()
+		tmpPath    string
+		tmpFile    *os.File
+	)
+
+	var lastChecksum string
+	for {
+		chunk, err := stream.Recv()
+		if err == io.EOF {
+			if tmpFile != nil {
+				tmpFile.Close()
+			}
+			if filename != "" {
+				computed := hex.EncodeToString(hasher.Sum(nil))
+				if lastChecksum != "" && computed != lastChecksum {
+					os.Remove(tmpPath)
+					return fmt.Errorf("checksum mismatch")
+				}
+				finalPath := filepath.Join(getStorageDir(), filename)
+				if renameErr := os.Rename(tmpPath, finalPath); renameErr != nil {
+					return fmt.Errorf("cannot finalise file: %w", renameErr)
+				}
+				s.mu.Lock()
+				s.files[filename] = &fileMeta{
+					Filename:   filename,
+					SizeBytes:  totalBytes,
+					UploadedBy: "replicated",
+					UploadedAt: time.Now().UnixMilli(),
+				}
+				s.mu.Unlock()
+				log.Printf("[FILE] ✅ replicated from primary: %s (%d bytes)", filename, totalBytes)
+			}
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("receive error: %w", err)
+		}
+
+		if filename == "" {
+			filename = filepath.Base(chunk.Filename)
+			tmpPath = filepath.Join(getStorageDir(), filename+".tmp")
+			var openErr error
+			tmpFile, openErr = os.Create(tmpPath)
+			if openErr != nil {
+				return fmt.Errorf("cannot create file: %w", openErr)
+			}
+			log.Printf("[FILE] replicating: %s", filename)
+		}
+
+		n, writeErr := tmpFile.Write(chunk.Content)
+		if writeErr != nil {
+			tmpFile.Close()
+			os.Remove(tmpPath)
+			return fmt.Errorf("write error: %w", writeErr)
+		}
+		totalBytes += int64(n)
+		hasher.Write(chunk.Content)
+		if chunk.Checksum != "" {
+			lastChecksum = chunk.Checksum
+		}
+	}
+
+	return stream.SendAndClose(&pb.UploadResponse{
+		Success:    true,
+		Message:    fmt.Sprintf("replicated %s", filename),
+		BytesSaved: totalBytes,
+	})
+}
+
+// replicateToBackup streams the saved file to the backup server.
+func (s *FileServer) replicateToBackup(filename string) {
+	path := filepath.Join(getStorageDir(), filename)
+	log.Printf("[FILE] replicating %s to backup at %s", filename, s.backupAddr)
+
+	conn, err := grpc.Dial(s.backupAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		log.Printf("[FILE] replication dial failed: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	client := pb.NewFileServiceClient(conn)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	stream, err := client.ReplicateFile(ctx)
+	if err != nil {
+		log.Printf("[FILE] replication stream failed: %v", err)
+		return
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		log.Printf("[FILE] replication open failed: %v", err)
+		return
+	}
+	defer f.Close()
+
+	hasher := md5.New()
+	io.Copy(hasher, f)
+	checksum := hex.EncodeToString(hasher.Sum(nil))
+	f.Seek(0, io.SeekStart)
+
+	buf := make([]byte, chunkSize)
+	var chunkIdx, totalSent int64
+	info, _ := f.Stat()
+
+	for {
+		n, readErr := f.Read(buf)
+		if n > 0 {
+			totalSent += int64(n)
+			isLast := totalSent >= info.Size()
+			chunk := &pb.FileChunk{
+				Filename:   filename,
+				Content:    buf[:n],
+				ChunkIndex: chunkIdx,
+				IsLast:     isLast,
+			}
+			if isLast {
+				chunk.Checksum = checksum
+			}
+			if sendErr := stream.Send(chunk); sendErr != nil {
+				log.Printf("[FILE] replication send error: %v", sendErr)
+				return
+			}
+			chunkIdx++
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			log.Printf("[FILE] replication read error: %v", readErr)
+			return
+		}
+	}
+
+	resp, err := stream.CloseAndRecv()
+	if err != nil {
+		log.Printf("[FILE] replication close error: %v", err)
+		return
+	}
+	log.Printf("[FILE] ✅ replicated %s to backup: %s", filename, resp.Message)
+}
+
+// DownloadFile streams the requested file to the client.
+func (s *FileServer) DownloadFile(req *pb.DownloadRequest, stream pb.FileService_DownloadFileServer) error {
+	filename := filepath.Base(req.Filename)
+	path := filepath.Join(getStorageDir(), filename)
+
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("file not found: %s", filename)
+	}
+	defer f.Close()
+
+	info, _ := f.Stat()
+	hasher := md5.New()
+	io.Copy(hasher, f)
+	checksum := hex.EncodeToString(hasher.Sum(nil))
+	f.Seek(0, io.SeekStart)
+
+	buf := make([]byte, chunkSize)
+	var chunkIdx, totalSent int64
+
+	for {
+		n, readErr := f.Read(buf)
+		if n > 0 {
+			totalSent += int64(n)
+			isLast := readErr == io.EOF || totalSent >= info.Size()
+			chunk := &pb.FileChunk{
+				Filename:   filename,
+				Content:    buf[:n],
+				ChunkIndex: chunkIdx,
+				IsLast:     isLast,
+			}
+			if isLast {
+				chunk.Checksum = checksum
+			}
+			if sendErr := stream.Send(chunk); sendErr != nil {
+				return fmt.Errorf("send error: %w", sendErr)
+			}
+			chunkIdx++
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return fmt.Errorf("read error: %w", readErr)
+		}
+	}
+	log.Printf("[FILE] download complete: %s", filename)
+	return nil
+}
+
+// ListFiles returns metadata for all files, including replicated ones.
+func (s *FileServer) ListFiles(_ context.Context, _ *pb.Empty) (*pb.FileList, error) {
+	s.mu.Lock()
+	entries, _ := os.ReadDir(getStorageDir())
+	for _, e := range entries {
+		if !e.IsDir() && filepath.Ext(e.Name()) != ".tmp" {
+			if _, exists := s.files[e.Name()]; !exists {
+				info, _ := e.Info()
+				s.files[e.Name()] = &fileMeta{
+					Filename:   e.Name(),
+					SizeBytes:  info.Size(),
+					UploadedBy: "replicated",
+					UploadedAt: info.ModTime().UnixMilli(),
+				}
+			}
+		}
+	}
+	s.mu.Unlock()
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var list []*pb.FileInfo
+	for _, m := range s.files {
+		list = append(list, &pb.FileInfo{
+			Filename:   m.Filename,
+			SizeBytes:  m.SizeBytes,
+			UploadedBy: m.UploadedBy,
+			UploadedAt: m.UploadedAt,
+		})
+	}
+	return &pb.FileList{Files: list}, nil
+}
